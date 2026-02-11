@@ -267,7 +267,7 @@ class UtiliCoreStableBot:
                     continue
                 
                 # Format message
-                priority_tag = "🔴 <b>High</b>" if alarm['priority'] else "⚪ Normal"
+                priority_tag = "🔴 <b>Urgent</b>" if alarm['priority'] else "⚪ Normal"
                 alarm_time = alarm['time'].strftime('%H:%M:%S %d/%m/%Y') if isinstance(alarm['time'], datetime) else str(alarm['time'])
                 print(priority_tag)
                 
