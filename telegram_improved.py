@@ -209,8 +209,9 @@ class UtiliCoreStableBot:
                 
                 alarms = []
                 for r in rows:
-                    des = r[3].replace('HIGH', 'Urgent').replace('High', 'Urgent')
-
+                    #des = r[3].replace('HIGH', 'Urgent').replace('High', 'Urgent')
+                    des = r[3]
+                    
                     alarms.append({
                         "index": r[0],
                         "time": r[1],
