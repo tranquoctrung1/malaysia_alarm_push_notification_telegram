@@ -1,0 +1,20 @@
+[Unit]
+Description=UtiliCore Telegram Alarm Bot
+After=network.target mongodb.service
+
+[Service]
+Type=simple
+User=your_username
+WorkingDirectory=/path/to/your/bot
+Environment="PATH=/path/to/your/venv/bin"
+ExecStart=/path/to/your/venv/bin/python telegram_improved.py
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=telegram-alarm-bot
+
+[Install]
+WantedBy=multi-user.target
