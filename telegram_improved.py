@@ -26,7 +26,7 @@ SQL_CONFIG = (
 )
 MONGO_URI = os.getenv('MONGO_URI', 'mongodb://localhost:27017')
 DB_NAME = os.getenv('MONGO_DB_NAME', 'vilog_malaysia')
-TG_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', "6652886477:AAGH4p0SKUPvrpV_CVWoISeLHNqnZ3hhdf8")
+TG_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', "")
 JSON_DB = os.getenv('JSON_DB_PATH', 'last_index.json')
 SCAN_INTERVAL = int(os.getenv('SCAN_INTERVAL', '120'))  # seconds
 MAX_RETRIES = int(os.getenv('MAX_RETRIES', '3'))
