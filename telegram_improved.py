@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sys
 import time
 import os
 from datetime import datetime
@@ -7,12 +8,13 @@ from contextlib import asynccontextmanager
 import pyodbc
 from motor.motor_asyncio import AsyncIOMotorClient
 from telegram import Bot
-from telegram.error import TelegramError
+from telegram.error import TelegramError, RetryAfter
 from loguru import logger
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Load environment variables from .env next to the exe/script
+_base_dir = os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__))
+load_dotenv(os.path.join(_base_dir, '.env'))
 
 # --- Cấu hình từ Environment Variables ---
 SQL_CONFIG = (
@@ -27,7 +29,9 @@ SQL_CONFIG = (
 MONGO_URI = os.getenv('MONGO_URI', 'mongodb://localhost:27017')
 DB_NAME = os.getenv('MONGO_DB_NAME', 'vilog_malaysia')
 TG_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', "")
-JSON_DB = os.getenv('JSON_DB_PATH', 'last_index.json')
+_exe_dir = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__))
+_json_db_raw = os.getenv('JSON_DB_PATH', 'last_index.json')
+JSON_DB = _json_db_raw if os.path.isabs(_json_db_raw) else os.path.join(_exe_dir, _json_db_raw)
 SCAN_INTERVAL = int(os.getenv('SCAN_INTERVAL', '120'))  # seconds
 MAX_RETRIES = int(os.getenv('MAX_RETRIES', '3'))
 
@@ -152,7 +156,7 @@ class UtiliCoreStableBot:
                                 {
                                     "isCheckList": True,
                                     "listSiteId": {
-                                        "$regex": f"(^|,){d_id}(,|$)"
+                                        "$regex": f"(^|,)\\s*{d_id}\\s*(,|$)"
                                     }
                                 }
                             ]
@@ -187,6 +191,21 @@ class UtiliCoreStableBot:
             logger.error(f"Lỗi truy vấn MongoDB Mapping (Device {device_id}): {e}")
         
         return chat_ids
+
+    async def get_all_chat_ids(self):
+        """Lấy toàn bộ chat_id có trong hệ thống (t_telegrams)"""
+        if self.db is None:
+            return []
+        try:
+            cursor = self.db.t_telegrams.find({}, {"chatId": 1})
+            ids = []
+            async for doc in cursor:
+                if "chatId" in doc:
+                    ids.append(doc["chatId"])
+            return list(set(ids))
+        except Exception as e:
+            logger.error(f"Lỗi lấy toàn bộ chat_id: {e}")
+            return []
 
     async def fetch_sql_alarms(self):
         """Lấy alarm từ SQL Server với retry mechanism"""
@@ -233,7 +252,7 @@ class UtiliCoreStableBot:
         logger.error("❌ Không thể lấy dữ liệu từ SQL sau nhiều lần thử")
         return []
 
-    async def send_telegram_safe(self, chat_id, message):
+    async def send_telegram_safe(self, chat_id, message, _retry=0):
         """Gửi tin nhắn Telegram với rate limiting và error handling"""
         try:
             await self.bot.send_message(
@@ -242,8 +261,19 @@ class UtiliCoreStableBot:
                 parse_mode='HTML',
                 disable_web_page_preview=True
             )
-            await asyncio.sleep(0.05)  # 50ms delay để tránh rate limit
+            await asyncio.sleep(0.5)  # 500ms delay giữa các tin
             return True
+        except RetryAfter as e:
+            wait = e.retry_after + 1
+            logger.warning(f"Flood control tới {chat_id}: chờ {wait}s")
+            if wait > 30:
+                logger.error(f"Flood wait {wait}s quá lớn, skip msg tới {chat_id}")
+                return False
+            await asyncio.sleep(wait)
+            if _retry < MAX_RETRIES:
+                return await self.send_telegram_safe(chat_id, message, _retry + 1)
+            logger.error(f"Hết retry sau flood control tới {chat_id}")
+            return False
         except TelegramError as e:
             logger.error(f"Lỗi gửi Telegram tới {chat_id}: {e}")
             return False
@@ -256,13 +286,14 @@ class UtiliCoreStableBot:
         success_count = 0
         failed_count = 0
         
+        all_chat_ids = await self.get_all_chat_ids()
+
         for alarm in alarms:
             try:
                 chat_ids = await self.get_target_chat_ids(alarm['device_id'])
                 
                 if not chat_ids:
-                    logger.warning(f"Không tìm thấy chat_id cho Device {alarm['device_id']}")
-                    # Vẫn cập nhật index để không bị stuck
+                    logger.warning(f"⚠️ Alarm {alarm['index']} (Device {alarm['device_id']}): Không tìm thấy chat_id nào — không gửi thông báo")
                     self.last_index = alarm['index']
                     self.save_last_index(self.last_index)
                     continue
@@ -283,12 +314,20 @@ class UtiliCoreStableBot:
                 )
                 
                 # Gửi tới tất cả chat_ids
-                sent = 0
+                sent_ids = []
+                failed_ids = []
                 for cid in chat_ids:
                     if await self.send_telegram_safe(cid, msg):
-                        sent += 1
-                
-                logger.info(f"✅ Alarm {alarm['index']}: Đã gửi tới {sent}/{len(chat_ids)} người dùng")
+                        sent_ids.append(cid)
+                    else:
+                        failed_ids.append(cid)
+
+                logger.info(f"✅ Alarm {alarm['index']}: Gửi thành công tới {len(sent_ids)}/{len(chat_ids)} chat_id: {sent_ids}")
+                if failed_ids:
+                    logger.warning(f"⚠️ Alarm {alarm['index']}: Gửi thất bại tới {len(failed_ids)} chat_id: {failed_ids}")
+                unassigned_ids = [cid for cid in all_chat_ids if cid not in chat_ids]
+                if unassigned_ids:
+                    logger.info(f"ℹ️ Alarm {alarm['index']}: {len(unassigned_ids)} chat_id tồn tại nhưng không được phân vào range của Device {alarm['device_id']}: {unassigned_ids}")
                 success_count += 1
                 
             except Exception as e:

@@ -5,7 +5,7 @@ a = Analysis(
     ['telegram_improved.py'],
     pathex=[],
     binaries=[],
-    datas=[('.env', '.')],
+    datas=[],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
