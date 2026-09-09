@@ -34,6 +34,68 @@ _json_db_raw = os.getenv('JSON_DB_PATH', 'last_index.json')
 JSON_DB = _json_db_raw if os.path.isabs(_json_db_raw) else os.path.join(_exe_dir, _json_db_raw)
 SCAN_INTERVAL = int(os.getenv('SCAN_INTERVAL', '120'))  # seconds
 MAX_RETRIES = int(os.getenv('MAX_RETRIES', '3'))
+LOCK_FILE = JSON_DB + '.lock'
+
+# Giữ file handle ở module scope để lock không bị giải phóng khi hàm kết thúc
+_lock_handle = None
+
+
+def acquire_single_instance_lock():
+    """Khoá chống chạy 2 instance cùng lúc trên cùng file last_index.
+
+    Trả về True nếu giành được khoá, False nếu đã có instance khác đang chạy.
+    """
+    global _lock_handle
+    try:
+        os.makedirs(os.path.dirname(LOCK_FILE) or '.', exist_ok=True)
+        if not os.path.exists(LOCK_FILE):
+            open(LOCK_FILE, 'w', encoding='utf-8').close()
+        handle = open(LOCK_FILE, 'r+', encoding='utf-8')
+        handle.seek(0)
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return False
+
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"{os.getpid()} {datetime.now().isoformat()}\n")
+        handle.flush()
+        _lock_handle = handle
+        logger.info(f"🔒 Đã giành khoá single-instance: {LOCK_FILE} (PID {os.getpid()})")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Lỗi khi tạo khoá single-instance {LOCK_FILE}: {e}")
+        return False
+
+
+def release_single_instance_lock():
+    """Giải phóng khoá single-instance (best effort)"""
+    global _lock_handle
+    if _lock_handle is None:
+        return
+    try:
+        if os.name == 'nt':
+            import msvcrt
+            _lock_handle.seek(0)
+            msvcrt.locking(_lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(_lock_handle.fileno(), fcntl.LOCK_UN)
+    except Exception as e:
+        logger.warning(f"⚠️  Không giải phóng được khoá: {e}")
+    finally:
+        try:
+            _lock_handle.close()
+        except Exception:
+            pass
+        _lock_handle = None
 
 # Setup logging với rotation và compression
 logger.add(
@@ -82,13 +144,20 @@ class UtiliCoreStableBot:
         """Lưu last processed index vào JSON file"""
         try:
             # Đảm bảo thư mục tồn tại
-            os.makedirs(os.path.dirname(JSON_DB) if os.path.dirname(JSON_DB) else '.', exist_ok=True)
-            
-            with open(JSON_DB, 'w', encoding='utf-8') as f:
+            target_dir = os.path.dirname(JSON_DB) if os.path.dirname(JSON_DB) else '.'
+            os.makedirs(target_dir, exist_ok=True)
+
+            # Ghi atomic: ghi ra file tạm cùng thư mục rồi replace, tránh file JSON
+            # bị hỏng/đọc dở nếu process bị kill giữa chừng
+            tmp_path = os.path.join(target_dir, f".{os.path.basename(JSON_DB)}.{os.getpid()}.tmp")
+            with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump({
                     "last_index": index,
                     "updated_at": datetime.now().isoformat()
                 }, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, JSON_DB)
         except Exception as e:
             logger.error(f"Lỗi ghi file JSON: {e}")
 
@@ -440,16 +509,28 @@ class UtiliCoreStableBot:
 
 async def main():
     """Main entry point"""
-    bot = UtiliCoreStableBot()
-    
+    # Chống chạy trùng instance: 2 process cùng ghi last_index.json sẽ ghi đè
+    # lẫn nhau và làm last_index bị tụt về giá trị cũ
+    if not acquire_single_instance_lock():
+        logger.critical(
+            f"❌ Đã có instance khác của bot đang chạy (khoá {LOCK_FILE}). "
+            f"Dừng process này để tránh ghi đè last_index."
+        )
+        sys.exit(1)
+
     try:
-        await bot.start_monitoring()
-    except KeyboardInterrupt:
-        logger.info("⚠️  Nhận tín hiệu dừng từ người dùng (Ctrl+C)")
-    except Exception as e:
-        logger.critical(f"💥 Bot dừng do lỗi nghiêm trọng: {e}", exc_info=True)
+        bot = UtiliCoreStableBot()
+
+        try:
+            await bot.start_monitoring()
+        except KeyboardInterrupt:
+            logger.info("⚠️  Nhận tín hiệu dừng từ người dùng (Ctrl+C)")
+        except Exception as e:
+            logger.critical(f"💥 Bot dừng do lỗi nghiêm trọng: {e}", exc_info=True)
+        finally:
+            await bot.shutdown()
     finally:
-        await bot.shutdown()
+        release_single_instance_lock()
 
 
 if __name__ == "__main__":
